@@ -326,8 +326,14 @@ func TestForStateAddSamples(t *testing.T) {
 	}
 }
 
-func TestForStateRestore(t *testing.T) {
+// sortAlerts sorts `[]*Alert` w.r.t. the Labels.
+func sortAlerts(items []*Alert) {
+	sort.Slice(items, func(i, j int) bool {
+		return labels.Compare(items[i].Labels, items[j].Labels) <= 0
+	})
+}
 
+func TestForStateRestore(t *testing.T) {
 	suite, err := promql.NewTest(t, `
 		load 5m
 		http_requests{job="app-server", instance="0", group="canary", severity="overwrite-me"}	75  85 50 0 0 25 0 0 40 0 120
@@ -364,7 +370,6 @@ func TestForStateRestore(t *testing.T) {
 	)
 
 	group := NewGroup("default", "", time.Second, []Rule{rule}, true, opts)
-
 	groups := make(map[string]*Group)
 	groups["default;"] = group
 
@@ -385,7 +390,6 @@ func TestForStateRestore(t *testing.T) {
 	})
 
 	// Prometheus goes down here. We create new rules and groups.
-
 	type testInput struct {
 		restoreDuration time.Duration
 		alerts          []*Alert
@@ -399,9 +403,9 @@ func TestForStateRestore(t *testing.T) {
 	tests := []testInput{
 		{
 			// Normal restore (alerts were not firing).
-			restoreDuration: 10 * time.Minute,
+			restoreDuration: 15 * time.Minute,
 			alerts:          rule.ActiveAlerts(),
-			downDuration:    5 * time.Minute,
+			downDuration:    10 * time.Minute,
 		},
 		{
 			// Testing Outage Tolerance.
@@ -429,11 +433,6 @@ func TestForStateRestore(t *testing.T) {
 		newGroups := make(map[string]*Group)
 		newGroups["default;"] = newGroup
 
-		m := NewManager(opts)
-		m.mtx.Lock()
-		m.groups = newGroups
-		m.mtx.Unlock()
-
 		restoreTime := baseTime.Add(tst.restoreDuration)
 		// First eval before restoration.
 		newGroup.Eval(suite.Context(), restoreTime)
@@ -449,7 +448,6 @@ func TestForStateRestore(t *testing.T) {
 		})
 
 		// Checking if we have restored it correctly.
-
 		if tst.noRestore {
 			testutil.Equals(t, tst.num, len(got))
 			for _, e := range got {
@@ -463,6 +461,8 @@ func TestForStateRestore(t *testing.T) {
 		} else {
 			exp := tst.alerts
 			testutil.Equals(t, len(exp), len(got))
+			sortAlerts(exp)
+			sortAlerts(got)
 			for i, e := range exp {
 				testutil.Equals(t, e.Labels, got[i].Labels)
 
@@ -494,7 +494,14 @@ func TestForStateRestore(t *testing.T) {
 func TestStaleness(t *testing.T) {
 	storage := testutil.NewStorage(t)
 	defer storage.Close()
-	engine := promql.NewEngine(nil, nil, 10, 10*time.Second)
+	engineOpts := promql.EngineOpts{
+		Logger:        nil,
+		Reg:           nil,
+		MaxConcurrent: 10,
+		MaxSamples:    10,
+		Timeout:       10 * time.Second,
+	}
+	engine := promql.NewEngine(engineOpts)
 	opts := &ManagerOptions{
 		QueryFunc:  EngineQueryFunc(engine, storage),
 		Appendable: storage,
@@ -531,7 +538,7 @@ func TestStaleness(t *testing.T) {
 	matcher, err := labels.NewMatcher(labels.MatchEqual, model.MetricNameLabel, "a_plus_one")
 	testutil.Ok(t, err)
 
-	set, err := querier.Select(nil, matcher)
+	set, _, err := querier.Select(nil, matcher)
 	testutil.Ok(t, err)
 
 	samples, err := readSeriesSet(set)
@@ -545,13 +552,13 @@ func TestStaleness(t *testing.T) {
 	metricSample[2].V = 42 // reflect.DeepEqual cannot handle NaN.
 
 	want := map[string][]promql.Point{
-		metric: []promql.Point{{0, 2}, {1000, 3}, {2000, 42}},
+		metric: {{0, 2}, {1000, 3}, {2000, 42}},
 	}
 
 	testutil.Equals(t, want, samples)
 }
 
-// Convert a SeriesSet into a form useable with reflect.DeepEqual.
+// Convert a SeriesSet into a form usable with reflect.DeepEqual.
 func readSeriesSet(ss storage.SeriesSet) (map[string][]promql.Point, error) {
 	result := map[string][]promql.Point{}
 
@@ -577,38 +584,44 @@ func TestCopyState(t *testing.T) {
 			NewAlertingRule("alert", nil, 0, nil, nil, true, nil),
 			NewRecordingRule("rule1", nil, nil),
 			NewRecordingRule("rule2", nil, nil),
-			NewRecordingRule("rule3", nil, nil),
-			NewRecordingRule("rule3", nil, nil),
+			NewRecordingRule("rule3", nil, labels.Labels{{Name: "l1", Value: "v1"}}),
+			NewRecordingRule("rule3", nil, labels.Labels{{Name: "l1", Value: "v2"}}),
+			NewAlertingRule("alert2", nil, 0, labels.Labels{{Name: "l2", Value: "v1"}}, nil, true, nil),
 		},
 		seriesInPreviousEval: []map[string]labels.Labels{
-			map[string]labels.Labels{"a": nil},
-			map[string]labels.Labels{"r1": nil},
-			map[string]labels.Labels{"r2": nil},
-			map[string]labels.Labels{"r3a": nil},
-			map[string]labels.Labels{"r3b": nil},
+			{"a": nil},
+			{"r1": nil},
+			{"r2": nil},
+			{"r3a": labels.Labels{{Name: "l1", Value: "v1"}}},
+			{"r3b": labels.Labels{{Name: "l1", Value: "v2"}}},
+			{"a2": labels.Labels{{Name: "l2", Value: "v1"}}},
 		},
 		evaluationDuration: time.Second,
 	}
 	oldGroup.rules[0].(*AlertingRule).active[42] = nil
 	newGroup := &Group{
 		rules: []Rule{
-			NewRecordingRule("rule3", nil, nil),
-			NewRecordingRule("rule3", nil, nil),
-			NewRecordingRule("rule3", nil, nil),
+			NewRecordingRule("rule3", nil, labels.Labels{{Name: "l1", Value: "v0"}}),
+			NewRecordingRule("rule3", nil, labels.Labels{{Name: "l1", Value: "v1"}}),
+			NewRecordingRule("rule3", nil, labels.Labels{{Name: "l1", Value: "v2"}}),
 			NewAlertingRule("alert", nil, 0, nil, nil, true, nil),
 			NewRecordingRule("rule1", nil, nil),
+			NewAlertingRule("alert2", nil, 0, labels.Labels{{Name: "l2", Value: "v0"}}, nil, true, nil),
+			NewAlertingRule("alert2", nil, 0, labels.Labels{{Name: "l2", Value: "v1"}}, nil, true, nil),
 			NewRecordingRule("rule4", nil, nil),
 		},
-		seriesInPreviousEval: make([]map[string]labels.Labels, 6),
+		seriesInPreviousEval: make([]map[string]labels.Labels, 8),
 	}
 	newGroup.CopyState(oldGroup)
 
 	want := []map[string]labels.Labels{
-		map[string]labels.Labels{"r3a": nil},
-		map[string]labels.Labels{"r3b": nil},
 		nil,
-		map[string]labels.Labels{"a": nil},
-		map[string]labels.Labels{"r1": nil},
+		{"r3a": labels.Labels{{Name: "l1", Value: "v1"}}},
+		{"r3b": labels.Labels{{Name: "l1", Value: "v2"}}},
+		{"a": nil},
+		{"r1": nil},
+		nil,
+		{"a2": labels.Labels{{Name: "l2", Value: "v1"}}},
 		nil,
 	}
 	testutil.Equals(t, want, newGroup.seriesInPreviousEval)
@@ -621,11 +634,25 @@ func TestUpdate(t *testing.T) {
 	expected := map[string]labels.Labels{
 		"test": labels.FromStrings("name", "value"),
 	}
+	storage := testutil.NewStorage(t)
+	defer storage.Close()
+	opts := promql.EngineOpts{
+		Logger:        nil,
+		Reg:           nil,
+		MaxConcurrent: 10,
+		MaxSamples:    10,
+		Timeout:       10 * time.Second,
+	}
+	engine := promql.NewEngine(opts)
 	ruleManager := NewManager(&ManagerOptions{
-		Context: context.Background(),
-		Logger:  log.NewNopLogger(),
+		Appendable: storage,
+		TSDB:       storage,
+		QueryFunc:  EngineQueryFunc(engine, storage),
+		Context:    context.Background(),
+		Logger:     log.NewNopLogger(),
 	})
 	ruleManager.Run()
+	defer ruleManager.Stop()
 
 	err := ruleManager.Update(10*time.Second, files)
 	testutil.Ok(t, err)
@@ -643,4 +670,63 @@ func TestUpdate(t *testing.T) {
 			testutil.Equals(t, expected, actual)
 		}
 	}
+}
+
+func TestNotify(t *testing.T) {
+	storage := testutil.NewStorage(t)
+	defer storage.Close()
+	engineOpts := promql.EngineOpts{
+		Logger:        nil,
+		Reg:           nil,
+		MaxConcurrent: 10,
+		MaxSamples:    10,
+		Timeout:       10 * time.Second,
+	}
+	engine := promql.NewEngine(engineOpts)
+	var lastNotified []*Alert
+	notifyFunc := func(ctx context.Context, expr string, alerts ...*Alert) {
+		lastNotified = alerts
+	}
+	opts := &ManagerOptions{
+		QueryFunc:   EngineQueryFunc(engine, storage),
+		Appendable:  storage,
+		TSDB:        storage,
+		Context:     context.Background(),
+		Logger:      log.NewNopLogger(),
+		NotifyFunc:  notifyFunc,
+		ResendDelay: 2 * time.Second,
+	}
+
+	expr, err := promql.ParseExpr("a > 1")
+	testutil.Ok(t, err)
+	rule := NewAlertingRule("aTooHigh", expr, 0, labels.Labels{}, labels.Labels{}, true, log.NewNopLogger())
+	group := NewGroup("alert", "", time.Second, []Rule{rule}, true, opts)
+
+	app, _ := storage.Appender()
+	app.Add(labels.FromStrings(model.MetricNameLabel, "a"), 1000, 2)
+	app.Add(labels.FromStrings(model.MetricNameLabel, "a"), 2000, 3)
+	app.Add(labels.FromStrings(model.MetricNameLabel, "a"), 5000, 3)
+	app.Add(labels.FromStrings(model.MetricNameLabel, "a"), 6000, 0)
+
+	err = app.Commit()
+	testutil.Ok(t, err)
+
+	ctx := context.Background()
+
+	// Alert sent right away
+	group.Eval(ctx, time.Unix(1, 0))
+	testutil.Equals(t, 1, len(lastNotified))
+	testutil.Assert(t, !lastNotified[0].ValidUntil.IsZero(), "ValidUntil should not be zero")
+
+	// Alert is not sent 1s later
+	group.Eval(ctx, time.Unix(2, 0))
+	testutil.Equals(t, 0, len(lastNotified))
+
+	// Alert is resent at t=5s
+	group.Eval(ctx, time.Unix(5, 0))
+	testutil.Equals(t, 1, len(lastNotified))
+
+	// Resolution alert sent right away
+	group.Eval(ctx, time.Unix(6, 0))
+	testutil.Equals(t, 1, len(lastNotified))
 }
